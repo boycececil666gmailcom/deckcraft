@@ -3,6 +3,12 @@
 //! On Windows, decodes native clipboard bitmaps (CF_DIB / CF_DIBV5) as well as registered PNG
 //! payloads into PNG byte buffers. On macOS, reads Keynote/Pages TIFF pictures decoded by arboard.
 
+/// Plain text currently on the pasteboard, when there is some.
+pub fn text() -> Option<String> {
+    let mut cb = arboard::Clipboard::new().ok()?;
+    cb.get_text().ok()
+}
+
 /// HTML currently on the pasteboard, when there is some.
 pub fn html() -> Option<String> {
     let mut cb = arboard::Clipboard::new().ok()?;
@@ -33,6 +39,7 @@ pub fn image_png() -> Option<Vec<u8>> {
     arboard_image_png()
 }
 
+/// Decodes an image from the pasteboard via arboard as fallback.
 fn arboard_image_png() -> Option<Vec<u8>> {
     let mut cb = arboard::Clipboard::new().ok()?;
     let img = cb.get_image().ok()?;
@@ -44,6 +51,7 @@ fn arboard_image_png() -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Queries native Windows clipboard formats (registered PNG, CF_DIBV5, CF_DIB) and decodes them.
 #[cfg(target_os = "windows")]
 fn windows_image_png() -> Option<Vec<u8>> {
     let _clip = clipboard_win::Clipboard::new_attempts(10).ok()?;
@@ -89,6 +97,7 @@ fn windows_image_png() -> Option<Vec<u8>> {
 }
 
 /// Decodes raw CF_DIB or CF_DIBV5 bytes from the Windows clipboard into PNG bytes.
+#[cfg(any(target_os = "windows", test))]
 pub fn decode_dib_to_png(data: &[u8]) -> Option<Vec<u8>> {
     let rgba = decode_dib(data)?;
     let mut out = Vec::new();
@@ -97,6 +106,7 @@ pub fn decode_dib_to_png(data: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Decodes raw CF_DIB or CF_DIBV5 bytes into an RGBA image.
+#[cfg(any(target_os = "windows", test))]
 pub fn decode_dib(data: &[u8]) -> Option<image::RgbaImage> {
     if data.len() < 40 {
         return None;
@@ -131,9 +141,20 @@ pub fn decode_dib(data: &[u8]) -> Option<image::RgbaImage> {
     } else {
         0
     };
-    let palette_colors = if bit_count <= 8 { if clr_used != 0 { clr_used as usize } else { 1 << bit_count } } else { clr_used as usize };
+    let palette_colors = if bit_count <= 8 {
+        let max_colors = 1usize << bit_count;
+        if clr_used != 0 { (clr_used as usize).min(max_colors) } else { max_colors }
+    } else {
+        if clr_used > 65536 {
+            return None;
+        }
+        clr_used as usize
+    };
     let palette_size = palette_colors.checked_mul(4)?;
     let offset_to_bits = header_size.checked_add(mask_size)?.checked_add(palette_size)?;
+    if offset_to_bits > data.len() {
+        return None;
+    }
 
     if (bit_count == 24 || bit_count == 32)
         && (compression == 0 || compression == 3)
@@ -146,6 +167,8 @@ pub fn decode_dib(data: &[u8]) -> Option<image::RgbaImage> {
     None
 }
 
+/// Synthesizes a BMP file header and decodes DIB data using the image crate's BMP decoder.
+#[cfg(any(target_os = "windows", test))]
 fn decode_via_bmp_file(data: &[u8], header_size: usize, bit_count: u16, compression: u32, clr_used: u32) -> Option<image::RgbaImage> {
     let mask_size = if header_size == 40 && compression == 3 {
         12
@@ -154,9 +177,20 @@ fn decode_via_bmp_file(data: &[u8], header_size: usize, bit_count: u16, compress
     } else {
         0
     };
-    let palette_colors = if bit_count <= 8 { if clr_used != 0 { clr_used as usize } else { 1 << bit_count } } else { clr_used as usize };
+    let palette_colors = if bit_count <= 8 {
+        let max_colors = 1usize << bit_count;
+        if clr_used != 0 { (clr_used as usize).min(max_colors) } else { max_colors }
+    } else {
+        if clr_used > 65536 {
+            return None;
+        }
+        clr_used as usize
+    };
     let palette_size = palette_colors.checked_mul(4)?;
     let offset_to_bits = header_size.checked_add(mask_size)?.checked_add(palette_size)?;
+    if offset_to_bits > data.len() {
+        return None;
+    }
     let bf_off_bits = u32::try_from(14usize.checked_add(offset_to_bits)?).ok()?;
     let bf_size = u32::try_from(14usize.checked_add(data.len())?).ok()?;
 
@@ -189,6 +223,8 @@ fn decode_via_bmp_file(data: &[u8], header_size: usize, bit_count: u16, compress
     Some(dyn_img.to_rgba8())
 }
 
+/// Restores alpha to 255 if all pixels in an RGBA image have zero alpha (GDI zero-alpha quirk).
+#[cfg(any(target_os = "windows", test))]
 fn fix_alpha_if_all_transparent(rgba: &mut image::RgbaImage) {
     if rgba.pixels().all(|p| p[3] == 0) {
         for p in rgba.pixels_mut() {
@@ -197,6 +233,8 @@ fn fix_alpha_if_all_transparent(rgba: &mut image::RgbaImage) {
     }
 }
 
+/// Fallback direct decoder for uncompressed 24-bit and 32-bit DIB bitmaps.
+#[cfg(any(target_os = "windows", test))]
 fn decode_uncompressed_dib(
     data: &[u8],
     header_size: usize,
@@ -287,6 +325,8 @@ fn decode_uncompressed_dib(
     Some(img)
 }
 
+/// Computes the bit shift for a bitfield mask.
+#[cfg(any(target_os = "windows", test))]
 fn mask_shift(mask: u32) -> u32 {
     if mask == 0 {
         return 0;
