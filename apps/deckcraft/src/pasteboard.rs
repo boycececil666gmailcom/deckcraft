@@ -113,7 +113,7 @@ pub fn decode_dib(data: &[u8]) -> Option<image::RgbaImage> {
     let compression = u32::from_le_bytes(data[16..20].try_into().ok()?);
     let clr_used = u32::from_le_bytes(data[32..36].try_into().ok()?);
 
-    if width <= 0 || height == 0 || planes != 1 {
+    if width <= 0 || width > 65535 || height == 0 || height.unsigned_abs() > 65535 || planes != 1 {
         return None;
     }
 
@@ -132,7 +132,8 @@ pub fn decode_dib(data: &[u8]) -> Option<image::RgbaImage> {
         0
     };
     let palette_colors = if bit_count <= 8 { if clr_used != 0 { clr_used as usize } else { 1 << bit_count } } else { clr_used as usize };
-    let offset_to_bits = header_size + mask_size + palette_colors * 4;
+    let palette_size = palette_colors.checked_mul(4)?;
+    let offset_to_bits = header_size.checked_add(mask_size)?.checked_add(palette_size)?;
 
     if (bit_count == 24 || bit_count == 32)
         && (compression == 0 || compression == 3)
@@ -154,10 +155,10 @@ fn decode_via_bmp_file(data: &[u8], header_size: usize, bit_count: u16, compress
         0
     };
     let palette_colors = if bit_count <= 8 { if clr_used != 0 { clr_used as usize } else { 1 << bit_count } } else { clr_used as usize };
-    let palette_size = palette_colors * 4;
-    let offset_to_bits = header_size + mask_size + palette_size;
-    let bf_off_bits = u32::try_from(14 + offset_to_bits).ok()?;
-    let bf_size = u32::try_from(14 + data.len()).ok()?;
+    let palette_size = palette_colors.checked_mul(4)?;
+    let offset_to_bits = header_size.checked_add(mask_size)?.checked_add(palette_size)?;
+    let bf_off_bits = u32::try_from(14usize.checked_add(offset_to_bits)?).ok()?;
+    let bf_size = u32::try_from(14usize.checked_add(data.len())?).ok()?;
 
     let mut bmp = Vec::with_capacity(14 + data.len());
     bmp.extend_from_slice(b"BM");
@@ -210,7 +211,7 @@ fn decode_uncompressed_dib(
     let top_down = height < 0;
 
     let bytes_per_pixel = usize::from(bit_count / 8);
-    let row_stride = (w as usize * bytes_per_pixel).div_ceil(4) * 4;
+    let row_stride = (w as usize).checked_mul(bytes_per_pixel)?.div_ceil(4).checked_mul(4)?;
     let total_pixel_bytes = row_stride.checked_mul(h as usize)?;
 
     if offset_to_bits > data.len() {
@@ -455,6 +456,126 @@ mod tests {
         assert!(super::decode_dib_to_png(&[]).is_none());
         assert!(super::decode_dib_to_png(&[0u8; 10]).is_none());
         assert!(super::decode_dib_to_png(&[40, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn small_1x1_dibv5_decodes_successfully() {
+        let dib = make_cf_dibv5_32(1, 1, &[10, 20, 30, 255], 0xff000000);
+        let png = super::decode_dib_to_png(&dib).expect("png");
+        let decoded = image::load_from_memory(&png).expect("decode").to_rgba8();
+        assert_eq!(decoded.width(), 1);
+        assert_eq!(decoded.height(), 1);
+        let p = decoded.get_pixel(0, 0);
+        assert_eq!(p[0], 30);
+        assert_eq!(p[1], 20);
+        assert_eq!(p[2], 10);
+        assert_eq!(p[3], 255);
+    }
+
+    #[test]
+    fn cf_dib_16bit_565_decodes_to_valid_png() {
+        let width: i32 = 2;
+        let height: i32 = 2;
+        let w = width as usize;
+        let h = height as usize;
+        let row_stride = (w * 2).div_ceil(4) * 4;
+        let mut dib = vec![0u8; 40 + 12 + row_stride * h];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&width.to_le_bytes());
+        dib[8..12].copy_from_slice(&height.to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&16u16.to_le_bytes());
+        dib[16..20].copy_from_slice(&3u32.to_le_bytes()); // BI_BITFIELDS
+        dib[20..24].copy_from_slice(&(row_stride as u32 * h as u32).to_le_bytes());
+        // Masks: Red 0xF800, Green 0x07E0, Blue 0x001F
+        dib[40..44].copy_from_slice(&0x0000f800u32.to_le_bytes());
+        dib[44..48].copy_from_slice(&0x000007e0u32.to_le_bytes());
+        dib[48..52].copy_from_slice(&0x0000001fu32.to_le_bytes());
+
+        // Red pixels (0xF800)
+        for y in 0..h {
+            let row_start = 52 + y * row_stride;
+            for x in 0..w {
+                let px = row_start + x * 2;
+                dib[px..px + 2].copy_from_slice(&0xf800u16.to_le_bytes());
+            }
+        }
+
+        let png = super::decode_dib_to_png(&dib).expect("png");
+        let decoded = image::load_from_memory(&png).expect("decode").to_rgba8();
+        assert_eq!(decoded.width(), 2);
+        assert_eq!(decoded.height(), 2);
+        let p = decoded.get_pixel(0, 0);
+        assert!(p[0] > 240 && p[1] < 10 && p[2] < 10 && p[3] == 255, "red pixel: {p:?}");
+    }
+
+    #[test]
+    fn cf_dib_16bit_555_decodes_to_valid_png() {
+        let width: i32 = 2;
+        let height: i32 = 2;
+        let w = width as usize;
+        let h = height as usize;
+        let row_stride = (w * 2).div_ceil(4) * 4;
+        let mut dib = vec![0u8; 40 + row_stride * h];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&width.to_le_bytes());
+        dib[8..12].copy_from_slice(&height.to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&16u16.to_le_bytes());
+        dib[16..20].copy_from_slice(&0u32.to_le_bytes()); // BI_RGB
+        dib[20..24].copy_from_slice(&(row_stride as u32 * h as u32).to_le_bytes());
+
+        // Green pixels in 5:5:5 (bits 5..10: 0x03E0)
+        for y in 0..h {
+            let row_start = 40 + y * row_stride;
+            for x in 0..w {
+                let px = row_start + x * 2;
+                dib[px..px + 2].copy_from_slice(&0x03e0u16.to_le_bytes());
+            }
+        }
+
+        let png = super::decode_dib_to_png(&dib).expect("png");
+        let decoded = image::load_from_memory(&png).expect("decode").to_rgba8();
+        assert_eq!(decoded.width(), 2);
+        assert_eq!(decoded.height(), 2);
+        let p = decoded.get_pixel(0, 0);
+        assert!(p[0] < 10 && p[1] > 240 && p[2] < 10 && p[3] == 255, "green pixel: {p:?}");
+    }
+
+    #[test]
+    fn cf_dib_8bit_paletted_decodes_to_valid_png() {
+        let width: i32 = 2;
+        let height: i32 = 2;
+        let w = width as usize;
+        let h = height as usize;
+        let row_stride = w.div_ceil(4) * 4;
+        let clr_used = 2u32;
+        let palette_size = clr_used as usize * 4;
+        let mut dib = vec![0u8; 40 + palette_size + row_stride * h];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&width.to_le_bytes());
+        dib[8..12].copy_from_slice(&height.to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&8u16.to_le_bytes());
+        dib[16..20].copy_from_slice(&0u32.to_le_bytes()); // BI_RGB
+        dib[32..36].copy_from_slice(&clr_used.to_le_bytes());
+
+        // Color 0: Blue [255, 0, 0, 0]
+        dib[40..44].copy_from_slice(&[255, 0, 0, 0]);
+        // Color 1: Yellow [0, 255, 255, 0]
+        dib[44..48].copy_from_slice(&[0, 255, 255, 0]);
+
+        // Row 0: index 1 (Yellow)
+        let row0 = 40 + palette_size;
+        dib[row0] = 1;
+        dib[row0 + 1] = 1;
+
+        let png = super::decode_dib_to_png(&dib).expect("png");
+        let decoded = image::load_from_memory(&png).expect("decode").to_rgba8();
+        assert_eq!(decoded.width(), 2);
+        assert_eq!(decoded.height(), 2);
+        let p = decoded.get_pixel(0, 1);
+        assert!(p[0] > 240 && p[1] > 240 && p[2] < 10 && p[3] == 255, "yellow pixel: {p:?}");
     }
 
     static CLIPBOARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
