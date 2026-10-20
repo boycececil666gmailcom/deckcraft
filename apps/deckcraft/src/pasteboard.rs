@@ -123,13 +123,17 @@ pub fn decode_dib(data: &[u8]) -> Option<image::RgbaImage> {
     let compression = u32::from_le_bytes(data[16..20].try_into().ok()?);
     let clr_used = u32::from_le_bytes(data[32..36].try_into().ok()?);
 
-    if width <= 0 || width > 65535 || height == 0 || height.unsigned_abs() > 65535 || planes != 1 {
+    if width <= 0 || width > 65535 || height == 0 || height.unsigned_abs() > 65535 || planes != 1 || !matches!(bit_count, 1 | 4 | 8 | 16 | 24 | 32) {
         return None;
     }
 
+    let declared_alpha = has_declared_alpha_mask(data, header_size, bit_count, compression);
+
     // Try standard BMP decoding by synthesizing a 14-byte BITMAPFILEHEADER.
     if let Some(mut img) = decode_via_bmp_file(data, header_size, bit_count, compression, clr_used) {
-        fix_alpha_if_all_transparent(&mut img);
+        if !declared_alpha {
+            fix_alpha_if_all_transparent(&mut img);
+        }
         return Some(img);
     }
 
@@ -158,13 +162,42 @@ pub fn decode_dib(data: &[u8]) -> Option<image::RgbaImage> {
 
     if (bit_count == 24 || bit_count == 32)
         && (compression == 0 || compression == 3)
-        && let Some(mut img) = decode_uncompressed_dib(data, header_size, width, height, bit_count, compression, offset_to_bits)
+        && let Some(mut img) = decode_uncompressed_dib(data, header_size, width, height, bit_count, compression, offset_to_bits, declared_alpha)
     {
-        fix_alpha_if_all_transparent(&mut img);
+        if !declared_alpha {
+            fix_alpha_if_all_transparent(&mut img);
+        }
         return Some(img);
     }
 
     None
+}
+
+/// Returns true if the DIB header declares an explicit non-zero alpha mask.
+#[cfg(any(target_os = "windows", test))]
+fn has_declared_alpha_mask(data: &[u8], header_size: usize, bit_count: u16, compression: u32) -> bool {
+    if bit_count != 32 {
+        return false;
+    }
+    // DIBV4 (108 bytes) and DIBV5 (124 bytes) declare bV4AlphaMask / bV5AlphaMask at offset 52..56.
+    if header_size >= 56
+        && data.len() >= 56
+        && let Ok(bytes) = data[52..56].try_into()
+        && u32::from_le_bytes(bytes) != 0
+    {
+        return true;
+    }
+    // Standard 40-byte BITMAPINFOHEADER with BI_BITFIELDS (3) or BI_ALPHABITFIELDS (6)
+    // where an alpha mask is provided after the color table / masks.
+    if header_size == 40
+        && (compression == 3 || compression == 6)
+        && data.len() >= 56
+        && let Ok(bytes) = data[52..56].try_into()
+        && u32::from_le_bytes(bytes) != 0
+    {
+        return true;
+    }
+    false
 }
 
 /// Synthesizes a BMP file header and decodes DIB data using the image crate's BMP decoder.
@@ -201,9 +234,9 @@ fn decode_via_bmp_file(data: &[u8], header_size: usize, bit_count: u16, compress
     bmp.extend_from_slice(&bf_off_bits.to_le_bytes());
     bmp.extend_from_slice(data);
 
-    // If DIBV5 has 32-bit BI_RGB but carries an alpha mask (Chrome/Electron),
+    // If DIBV4/DIBV5 has 32-bit BI_RGB but carries an alpha mask (Chrome/Electron),
     // tweak compression to BI_BITFIELDS so the BMP decoder reads the alpha channel.
-    if header_size >= 124 && bit_count == 32 && compression == 0 && data.len() >= 56 {
+    if header_size >= 108 && bit_count == 32 && compression == 0 && data.len() >= 56 {
         let alpha_mask = u32::from_le_bytes(data[52..56].try_into().ok()?);
         if alpha_mask == 0xff000000 {
             // offset 14 + 16 is biCompression in the BMP file
@@ -243,6 +276,7 @@ fn decode_uncompressed_dib(
     bit_count: u16,
     compression: u32,
     offset_to_bits: usize,
+    declared_alpha: bool,
 ) -> Option<image::RgbaImage> {
     let w = u32::try_from(width).ok()?;
     let h = height.unsigned_abs();
@@ -280,8 +314,11 @@ fn decode_uncompressed_dib(
             (0x00ff0000, 0x0000ff00, 0x000000ff, 0)
         };
         (mask_shift(rm), mask_shift(gm), mask_shift(bm), if am != 0 { Some(mask_shift(am)) } else { None })
+    } else if bit_count == 32 && declared_alpha && data.len() >= 56 {
+        let am = u32::from_le_bytes(data[52..56].try_into().ok()?);
+        (16, 8, 0, (am != 0).then(|| mask_shift(am)))
     } else {
-        (16, 8, 0, if bit_count == 32 { Some(24) } else { None })
+        (16, 8, 0, None)
     };
 
     for y in 0..h {
@@ -316,7 +353,7 @@ fn decode_uncompressed_dib(
         }
     }
 
-    if bit_count == 32 && a_shift.is_some() && !has_non_zero_alpha {
+    if bit_count == 32 && a_shift.is_some() && !has_non_zero_alpha && !declared_alpha {
         for p in img.pixels_mut() {
             p[3] = 255;
         }
@@ -338,6 +375,7 @@ fn mask_shift(mask: u32) -> u32 {
 mod tests {
     use std::borrow::Cow;
 
+    /// Constructs a test CF_DIB buffer with 24-bit RGB depth.
     fn make_cf_dib_24(width: i32, height: i32, bgr: &[u8; 3]) -> Vec<u8> {
         let w = width as usize;
         let h = height.unsigned_abs() as usize;
@@ -361,6 +399,7 @@ mod tests {
         dib
     }
 
+    /// Constructs a test CF_DIB buffer with 32-bit RGBA depth.
     fn make_cf_dib_32(width: i32, height: i32, bgra: &[u8; 4]) -> Vec<u8> {
         let w = width as usize;
         let h = height.unsigned_abs() as usize;
@@ -384,6 +423,7 @@ mod tests {
         dib
     }
 
+    /// Constructs a test CF_DIBV5 buffer with 32-bit depth and explicit alpha mask.
     fn make_cf_dibv5_32(width: i32, height: i32, bgra: &[u8; 4], alpha_mask: u32) -> Vec<u8> {
         let w = width as usize;
         let h = height.unsigned_abs() as usize;
@@ -412,6 +452,7 @@ mod tests {
         dib
     }
 
+    /// Verifies that 24-bit CF_DIB bitmaps decode to valid PNG images.
     #[test]
     fn cf_dib_24bit_decodes_to_valid_png() {
         // Red pixel in BGR is [0, 0, 255]
@@ -427,6 +468,7 @@ mod tests {
         assert_eq!(p[3], 255);
     }
 
+    /// Verifies that 32-bit CF_DIB bitmaps with all-zero alpha (GDI quirk) become opaque.
     #[test]
     fn cf_dib_32bit_with_zero_alpha_becomes_opaque() {
         // Snipping Tool / GDI quirk: 32-bit BGRx with alpha = 0 for every pixel.
@@ -442,6 +484,7 @@ mod tests {
         assert_eq!(p[3], 255, "zero alpha should be restored to fully opaque");
     }
 
+    /// Verifies that 32-bit CF_DIBV5 bitmaps with explicit alpha masks preserve genuine transparency.
     #[test]
     fn cf_dibv5_32bit_with_alpha_mask_preserves_transparency() {
         // Chrome / modern browser quirk: BITMAPV5HEADER with alpha mask and semi-transparent alpha.
@@ -457,6 +500,31 @@ mod tests {
         assert_eq!(p[3], 180, "alpha channel should be preserved");
     }
 
+    /// Verifies that 32-bit CF_DIBV5 bitmaps declaring an explicit alpha mask preserve zero alpha.
+    #[test]
+    fn cf_dibv5_32bit_with_alpha_mask_and_all_zero_alpha_preserves_transparency() {
+        let dib = make_cf_dibv5_32(2, 2, &[10, 20, 30, 0], 0xff000000);
+        let png = super::decode_dib_to_png(&dib).expect("png");
+        let decoded = image::load_from_memory(&png).expect("decode").to_rgba8();
+        assert_eq!(decoded.width(), 2);
+        assert_eq!(decoded.height(), 2);
+        let p = decoded.get_pixel(0, 0);
+        assert_eq!(p[0], 30);
+        assert_eq!(p[1], 20);
+        assert_eq!(p[2], 10);
+        assert_eq!(p[3], 0, "explicit alpha mask with zero alpha must preserve transparency");
+    }
+
+    /// Verifies that 32-bit CF_DIBV5 bitmaps without an alpha mask (alpha_mask == 0) and zero alpha become opaque.
+    #[test]
+    fn cf_dibv5_32bit_without_alpha_mask_and_zero_alpha_becomes_opaque() {
+        let dib = make_cf_dibv5_32(2, 2, &[255, 128, 64, 0], 0);
+        let png = super::decode_dib_to_png(&dib).expect("png");
+        let decoded = image::load_from_memory(&png).expect("decode").to_rgba8();
+        assert_eq!(decoded.get_pixel(0, 0)[3], 255);
+    }
+
+    /// Verifies that top-down DIB bitmaps with negative height decode with correct row order.
     #[test]
     fn top_down_dib_decodes_with_correct_orientation() {
         // Top-down: negative height
@@ -491,6 +559,7 @@ mod tests {
         assert_eq!(bottom[2], 255, "bottom row is blue");
     }
 
+    /// Verifies that truncated or invalid DIB headers return None.
     #[test]
     fn invalid_or_truncated_dib_returns_none() {
         assert!(super::decode_dib_to_png(&[]).is_none());
@@ -498,6 +567,7 @@ mod tests {
         assert!(super::decode_dib_to_png(&[40, 0, 0, 0]).is_none());
     }
 
+    /// Verifies that minimal 1x1 CF_DIBV5 bitmaps decode successfully.
     #[test]
     fn small_1x1_dibv5_decodes_successfully() {
         let dib = make_cf_dibv5_32(1, 1, &[10, 20, 30, 255], 0xff000000);
@@ -512,6 +582,7 @@ mod tests {
         assert_eq!(p[3], 255);
     }
 
+    /// Verifies that 16-bit 5:6:5 BI_BITFIELDS DIB bitmaps decode to valid PNG images.
     #[test]
     fn cf_dib_16bit_565_decodes_to_valid_png() {
         let width: i32 = 2;
@@ -549,6 +620,7 @@ mod tests {
         assert!(p[0] > 240 && p[1] < 10 && p[2] < 10 && p[3] == 255, "red pixel: {p:?}");
     }
 
+    /// Verifies that 16-bit 5:5:5 BI_RGB DIB bitmaps decode to valid PNG images.
     #[test]
     fn cf_dib_16bit_555_decodes_to_valid_png() {
         let width: i32 = 2;
@@ -582,6 +654,7 @@ mod tests {
         assert!(p[0] < 10 && p[1] > 240 && p[2] < 10 && p[3] == 255, "green pixel: {p:?}");
     }
 
+    /// Verifies that 8-bit paletted DIB bitmaps decode with correct palette lookup.
     #[test]
     fn cf_dib_8bit_paletted_decodes_to_valid_png() {
         let width: i32 = 2;
@@ -620,6 +693,7 @@ mod tests {
 
     static CLIPBOARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Round-trip test: writes 24-bit CF_DIB to native Windows clipboard and verifies decoding.
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_clipboard_dib_round_trip() {
@@ -642,6 +716,7 @@ mod tests {
         assert!(p[0] > 200 && p[1] < 40 && p[2] < 40 && p[3] > 200, "pixel should be red: {p:?}");
     }
 
+    /// Round-trip test: writes 32-bit CF_DIBV5 to native Windows clipboard and verifies decoding.
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_clipboard_dibv5_round_trip() {
@@ -664,6 +739,7 @@ mod tests {
         assert!(p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] == 180, "pixel should be green with alpha 180: {p:?}");
     }
 
+    /// Round-trip test: writes 32-bit zero-alpha CF_DIB (Snipping Tool format) and verifies opacity restoration.
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_clipboard_zero_alpha_snipping_tool_round_trip() {
@@ -713,6 +789,7 @@ mod tests {
     struct Restore(Option<String>);
 
     impl Drop for Restore {
+        /// Restores previous clipboard text on drop.
         fn drop(&mut self) {
             let Ok(mut cb) = arboard::Clipboard::new() else { return };
             match self.0.take() {
