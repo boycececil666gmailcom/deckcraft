@@ -654,7 +654,14 @@ impl SlideApp {
     /// Run a command by id (UI commands here, everything else in the engine). Errors show in the
     /// status bar and are returned.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
-        let r = if UI_COMMANDS.iter().any(|c| c.0 == id) {
+        let r = if id == "edit.paste" && params.as_object().is_none_or(|m| m.is_empty()) {
+            if let Some(png) = self.services.clipboard_image.as_mut().and_then(|f| f()) {
+                let data = deckcraft_engine::cmd::base64_encode(&png);
+                self.session.execute("insert.picture", &json!({"name": "Pasted image.png", "data": data})).map_err(|e| e.to_string())
+            } else {
+                self.session.execute(id, &params).map_err(|e| e.to_string())
+            }
+        } else if UI_COMMANDS.iter().any(|c| c.0 == id) {
             self.run_ui(id, &params)
         } else {
             self.session.execute(id, &params).map_err(|e| e.to_string())
@@ -2475,6 +2482,26 @@ mod tests {
         harness.event(v(false));
         harness.run_steps(2);
         assert_eq!(pictures(harness.state()), 1);
+    }
+
+    /// Paste from the ribbon, menus or context menu pastes the clipboard image when one is available (#53).
+    #[test]
+    fn menu_paste_inserts_an_image_when_available() {
+        let session = Session::with_new();
+        let png = {
+            let d = session.active().unwrap();
+            deckcraft_engine::cmd::file::render_png(&d.doc, 0, 0.1, false).0
+        };
+        assert!(!png.is_empty());
+        let services = Services { clipboard_image: Some(Box::new(move || Some(png.clone()))), ..Default::default() };
+        let mut app = SlideApp::new(session, services);
+        let pictures = |app: &SlideApp| {
+            let d = app.session.active().unwrap();
+            d.doc.slides[0].shapes.iter().filter(|s| matches!(s.kind, deckcraft_model::ShapeKind::Picture { .. })).count()
+        };
+        assert_eq!(pictures(&app), 0);
+        app.run("edit.paste", json!({})).unwrap();
+        assert_eq!(pictures(&app), 1, "menu paste should insert the clipboard image");
     }
 
     /// #78: after Tab in a text box, typing and deleting no longer reached the text.
